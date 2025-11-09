@@ -17,23 +17,23 @@ public static class IResultCursorExtensions
         string field = record.Keys.Single();
         object raw = record[field];
 
-        IDictionary<string, object> dict = raw switch
+        Dictionary<string, object> dict = raw switch
         {
-            IDictionary<string, object> dso => dso,
+            Dictionary<string, object> dso => dso,
             _ => throw new InvalidOperationException($"Field '{field}' is not a map (got {raw?.GetType().FullName ?? "null"}).")
         };
 
         return MapProperties<T>(dict);
     }
 
-    private static T MapProperties<T>(IDictionary<string, object> source) where T : new()
+    private static T MapProperties<T>(Dictionary<string, object> source) where T : new()
     {
         T instance = new();
         MapIntoInstance(instance, source);
         return instance;
     }
 
-    private static void MapIntoInstance(object destination, IDictionary<string, object> rawSource)
+    private static void MapIntoInstance(object destination, Dictionary<string, object> rawSource)
     {
         Dictionary<string, object> source = new(rawSource, StringComparer.OrdinalIgnoreCase);
 
@@ -57,109 +57,155 @@ public static class IResultCursorExtensions
         if (raw is null)
             return null;
 
+        targetType = GetUnderlyingTypeIfNullable(targetType);
+
+        Func<object, Type, object?> Map = GetMapper(raw, targetType);
+
+        return Map(raw, targetType);
+    }
+
+    private static Type GetUnderlyingTypeIfNullable(Type targetType)
+    {
         Type? underlying = Nullable.GetUnderlyingType(targetType);
         if (underlying is not null)
-            targetType = underlying;
+            return underlying;
+        return targetType;
+    }
 
-        Type rawType = raw.GetType();
-
-        if (targetType.IsAssignableFrom(rawType))
-            return raw;
+    private static Func<object, Type, object?> GetMapper(object raw, Type targetType)
+    {
+        if (targetType.IsAssignableFrom(raw.GetType()))
+            return MapAssignable;
 
         if (targetType == typeof(string))
-            return Convert.ToString(raw, CultureInfo.InvariantCulture);
+            return MapString;
 
         if (targetType.IsEnum)
-        {
-            if (raw is string s && Enum.TryParse(targetType, s, true, out object? enumVal))
-                return enumVal;
-            if (raw is IConvertible)
-                return Enum.ToObject(targetType, Convert.ToInt32(raw, CultureInfo.InvariantCulture));
-        }
+            return MapEnum;
 
         if (raw is IConvertible &&
-            (targetType.IsPrimitive ||
-             targetType == typeof(decimal) ||
-             targetType == typeof(DateTime) ||
-             targetType == typeof(Guid)))
+           (targetType.IsPrimitive ||
+            targetType == typeof(decimal) ||
+            targetType == typeof(DateTime) ||
+            targetType == typeof(Guid)))
         {
-            try
-            {
-                return Convert.ChangeType(raw, targetType, CultureInfo.InvariantCulture);
-            }
-            catch { }
-        }
-
-        if (targetType == typeof(DateTime) && raw is string dtStr &&
-            DateTime.TryParse(dtStr, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out DateTime dt))
-        {
-            return dt;
-        }
-
-        if (targetType == typeof(Guid) && raw is string guidStr &&
-            Guid.TryParse(guidStr, out Guid guid))
-        {
-            return guid;
+            return MapScalar;
         }
 
         if (targetType == typeof(DateTime))
         {
-            if (raw is ZonedDateTime zdt)
-                return zdt.ToDateTimeOffset().UtcDateTime;
-            if (raw is LocalDateTime ldt)
-                return new DateTime(ldt.Year, ldt.Month, ldt.Day, ldt.Hour, ldt.Minute, ldt.Second, ldt.Nanosecond / 1_000_000, DateTimeKind.Unspecified);
+            if (raw is string)
+                return MapDateTimeString;
+            return MapDateTimeNeo4jType;
         }
+
+        if (targetType == typeof(Guid) && raw is string)
+            return MapGuidString;
 
         if (typeof(IEnumerable).IsAssignableFrom(targetType) && targetType != typeof(string))
-        {
-            Type elemType = targetType.IsArray
-                ? targetType.GetElementType()!
-                : (targetType.IsGenericType ? targetType.GetGenericArguments().First() : typeof(object));
+            return MapEnumerable;
 
-            IEnumerable? rawEnum = raw as IEnumerable;
+        if (raw is Dictionary<string, object>)
+            return MapComplex;
 
-            if (rawEnum is not null && raw is not string)
-            {
-                Type listType = typeof(List<>).MakeGenericType(elemType);
-                IList tmp = (IList)Activator.CreateInstance(listType)!;
+        return MapFallback;
+    }
 
-                foreach (object item in rawEnum)
-                    tmp.Add(ConvertValueRecursive(item!, elemType));
+    private static object? MapAssignable(object raw, Type _) 
+        => raw;
 
-                if (targetType.IsArray)
-                {
-                    Array arr = Array.CreateInstance(elemType, tmp.Count);
-                    tmp.CopyTo(arr, 0);
-                    return arr;
-                }
-
-                if (targetType.IsAssignableFrom(listType))
-                    return tmp;
-
-                if (Activator.CreateInstance(targetType) is IList targetList)
-                {
-                    foreach (object i in tmp) targetList.Add(i);
-                    return targetList;
-                }
-
-                return tmp;
-            }
-        }
-
-        if (raw is IDictionary<string, object> dso)
-        {
-            object obj = Activator.CreateInstance(targetType)
-                      ?? throw new InvalidOperationException($"Cannot create {targetType.FullName}");
-            MapIntoInstance(obj, dso);
-            return obj;
-        }
+    private static object? MapString(object raw, Type _)
+        => Convert.ToString(raw, CultureInfo.InvariantCulture);
         
-        if (raw is IConvertible)
+    private static object? MapScalar(object raw, Type targetType)
+    {
+        try
         {
-            try { return Convert.ChangeType(raw, targetType, CultureInfo.InvariantCulture); }
-            catch { }
+            return Convert.ChangeType(raw, targetType, CultureInfo.InvariantCulture);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static object? MapEnum(object raw, Type targetType)
+    {
+        if (raw is string s && Enum.TryParse(targetType, s, true, out object? enumVal))
+            return enumVal;
+
+        if (raw is IConvertible)
+            return Enum.ToObject(targetType, Convert.ToInt32(raw, CultureInfo.InvariantCulture));
+
+        return null;
+    }
+
+    private static object? MapDateTimeString(object raw, Type _)
+        => DateTime.Parse((string)raw, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
+
+    private static object? MapGuidString(object raw, Type _)
+        => Guid.Parse((string)raw);
+
+    private static object? MapDateTimeNeo4jType(object raw, Type _)
+    {
+        if (raw is ZonedDateTime zdt)
+            return zdt.ToDateTimeOffset().UtcDateTime;
+
+        if (raw is LocalDateTime ldt)
+            return new DateTime(ldt.Year, ldt.Month, ldt.Day, ldt.Hour, ldt.Minute, ldt.Second, ldt.Nanosecond / 1_000_000, DateTimeKind.Unspecified);
+
+        return null;
+    }
+
+    private static object? MapEnumerable(object raw, Type targetType)
+    {
+        Type elemType = targetType.IsArray
+            ? targetType.GetElementType()!
+            : (targetType.IsGenericType ? targetType.GetGenericArguments().First() : typeof(object));
+
+        IEnumerable? rawEnum = raw as IEnumerable;
+
+        if (rawEnum is not null && raw is not string)
+        {
+            Type listType = typeof(List<>).MakeGenericType(elemType);
+            IList tmp = (IList)Activator.CreateInstance(listType)!;
+
+            foreach (object item in rawEnum)
+                tmp.Add(ConvertValueRecursive(item!, elemType));
+
+            if (targetType.IsArray)
+            {
+                Array arr = Array.CreateInstance(elemType, tmp.Count);
+                tmp.CopyTo(arr, 0);
+                return arr;
+            }
+
+            if (targetType.IsAssignableFrom(listType))
+                return tmp;
+
+            if (Activator.CreateInstance(targetType) is IList targetList)
+            {
+                foreach (object i in tmp) targetList.Add(i);
+                return targetList;
+            }
+
+            return tmp;
         }
 
         return null;
+    }
+
+    private static object? MapComplex(object raw, Type targetType)
+    {
+        object obj = Activator.CreateInstance(targetType)
+                    ?? throw new InvalidOperationException($"Cannot create {targetType.FullName}");
+        MapIntoInstance(obj, (Dictionary<string, object>)raw);
+        return obj;
+    }
+    
+    private static object? MapFallback(object raw, Type targetType)
+    {
+        try { return Convert.ChangeType(raw, targetType, CultureInfo.InvariantCulture); }
+        catch { return null; }
     }
 }
